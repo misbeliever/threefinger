@@ -63,6 +63,41 @@ brew services restart threefinger
 launchctl kickstart -k gui/$UID/com.firedev.threefinger
 ```
 
+### Send a URL action to a running app
+
+A `to` action can instead specify a `url` and the target app's `bundle_id`.
+threefinger sends the URL directly as a `get URL` Apple event, without opening
+the app through Launch Services. The app must already be running and must
+support that URL action. macOS may ask for permission to control the app under
+**Privacy & Security → Automation**. A failed or denied action is logged.
+
+For example, with HyprMac's **Allow other apps to control HyprMac** enabled:
+
+```json
+{
+  "description": "Cycle HyprMac workspaces",
+  "manipulators": [
+    { "from": { "gesture": "three_finger_swipe_left" }, "to": [
+      { "bundle_id": "com.zachgray.HyprMac", "url": "hyprmac://action/cycleWorkspace?delta=1" }
+    ] },
+    { "from": { "gesture": "three_finger_swipe_right" }, "to": [
+      { "bundle_id": "com.zachgray.HyprMac", "url": "hyprmac://action/cycleWorkspace?delta=-1" }
+    ] }
+  ]
+}
+```
+
+Each action must specify either `key_code` (with optional `modifiers`) or
+both `url` and `bundle_id`. URL actions do not launch a stopped app.
+While a URL action sequence is running, further URL gestures are dropped
+rather than queued. Keyboard-only gestures remain responsive. Actions within
+a sequence run in order; a failed action is logged and the sequence continues.
+
+## Development checks
+
+Run `python3 tests/check.py` to check configuration validation and gesture
+scheduling without posting keyboard events or controlling applications.
+
 ## Build from source
 
 ```sh

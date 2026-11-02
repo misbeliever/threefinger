@@ -1,4 +1,5 @@
 import Cocoa
+import Carbon
 
 setbuf(stdout, nil) // --debug output is tiny; unbuffered keeps it visible under redirection/launchd
 let debug = CommandLine.arguments.contains("-d") || CommandLine.arguments.contains("--debug")
@@ -253,7 +254,7 @@ let DEFAULT_CONFIG = """
 struct Config: Codable { var threshold: Float?; var manipulators: [Manipulator] }
 struct Manipulator: Codable { var from: From; var to: [To] }
 struct From: Codable { var gesture: String }
-struct To: Codable { var key_code: String; var modifiers: [String]? }
+struct To: Codable { var key_code: String?; var modifiers: [String]?; var url: String?; var bundle_id: String? }
 
 let configURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/threefinger.json")
 if !FileManager.default.fileExists(atPath: configURL.path) {
@@ -289,13 +290,24 @@ let MOD_FLAGS: [String: CGEventFlags] = [
 ]
 let GESTURES = ["three_finger_swipe_left", "three_finger_swipe_right", "three_finger_swipe_up", "three_finger_swipe_down"]
 
-var actions: [String: [(key: CGKeyCode, flags: CGEventFlags)]] = [:]
+enum GestureAction {
+    case key(CGKeyCode, CGEventFlags)
+    case url(String, String)
+}
+var actions: [String: [GestureAction]] = [:]
 for m in config.manipulators {
     guard GESTURES.contains(m.from.gesture) else { err("threefinger: unknown gesture '\(m.from.gesture)' — skipping manipulator"); continue }
-    var seq = [(key: CGKeyCode, flags: CGEventFlags)]()
+    var seq = [GestureAction]()
     var bad: String?
     outer: for t in m.to {
-        guard let key = KEY_CODES[t.key_code] else { bad = "key_code '\(t.key_code)'"; break }
+        if let url = t.url, let bundleID = t.bundle_id, t.key_code == nil, t.modifiers == nil,
+           !bundleID.isEmpty, let parsed = URL(string: url), parsed.scheme != nil {
+            seq.append(.url(url, bundleID))
+            continue
+        }
+        guard t.url == nil, t.bundle_id == nil, let keyName = t.key_code, let key = KEY_CODES[keyName] else {
+            bad = "action (expected key_code, or url with bundle_id)"; break
+        }
         var flags = CGEventFlags()
         for mod in t.modifiers ?? [] {
             var base = mod
@@ -303,7 +315,7 @@ for m in config.manipulators {
             guard let f = MOD_FLAGS[base] else { bad = "modifier '\(mod)'"; break outer }
             flags.insert(f)
         }
-        seq.append((key, flags))
+        seq.append(.key(key, flags))
     }
     if let b = bad { err("threefinger: unknown \(b) in '\(m.from.gesture)' — skipping manipulator"); continue }
     actions[m.from.gesture] = seq
@@ -331,15 +343,55 @@ if !axTrusted {
     }
 }
 
+let keyEventLock = NSLock()
+func perform(_ seq: [GestureAction]) {
+    let src = CGEventSource(stateID: .hidSystemState)
+    for action in seq {
+        switch action {
+        case let .key(key, flags):
+            keyEventLock.lock()
+            for down in [true, false] {
+                let e = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down)
+                e?.flags = flags
+                e?.post(tap: .cghidEventTap)
+            }
+            keyEventLock.unlock()
+        case let .url(url, bundleID):
+            guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else {
+                err("threefinger: app '\(bundleID)' is not running")
+                continue
+            }
+            let target = NSAppleEventDescriptor(processIdentifier: app.processIdentifier)
+            let event = NSAppleEventDescriptor(
+                eventClass: AEEventClass(kInternetEventClass), eventID: AEEventID(kAEGetURL),
+                targetDescriptor: target, returnID: AEReturnID(kAutoGenerateReturnID),
+                transactionID: AETransactionID(kAnyTransactionID))
+            event.setParam(NSAppleEventDescriptor(string: url), forKeyword: AEKeyword(keyDirectObject))
+            do {
+                let reply = try event.sendEvent(options: .waitForReply, timeout: 3)
+                if let code = reply.paramDescriptor(forKeyword: AEKeyword(keyErrorNumber))?.int32Value, code != 0 {
+                    let message = reply.paramDescriptor(forKeyword: AEKeyword(keyErrorString))?.stringValue ?? "Apple event error \(code)"
+                    err("threefinger: app '\(bundleID)' rejected URL: \(message)")
+                }
+            }
+            catch { err("threefinger: cannot send URL to '\(bundleID)': \(error.localizedDescription)") }
+        }
+    }
+}
+
+let actionQueue = DispatchQueue(label: "threefinger.actions")
+let urlActionSlot = DispatchSemaphore(value: 1)
 func fire(_ gesture: String) {
     guard let seq = actions[gesture] else { return } // unmapped gesture: fire nothing
-    let src = CGEventSource(stateID: .hidSystemState)
-    for (key, flags) in seq {
-        for down in [true, false] {
-            let e = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down)
-            e?.flags = flags
-            e?.post(tap: .cghidEventTap)
+    if seq.contains(where: { if case .url = $0 { return true }; return false }) {
+        // Drop URL gestures while busy so a slow app cannot build a stale swipe backlog.
+        guard urlActionSlot.wait(timeout: .now()) == .success else { log("gesture: \(gesture) skipped — URL action busy"); return }
+        actionQueue.async {
+            defer { urlActionSlot.signal() }
+            perform(seq)
         }
+    } else {
+        perform(seq)
     }
     log("gesture: \(gesture)")
 }
